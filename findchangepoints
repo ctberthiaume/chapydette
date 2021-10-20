@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+
+import click
+import contextlib
+import datetime
+import json
+import numpy as np
+import logging
+import os
+import pandas as pd
+import pickle
+import sklearn.metrics
+from sklearn.preprocessing import StandardScaler
+import sqlite3
+import time
+
+from chapydette import feature_generation, cp_estimation
+
+
+def filename_to_dates(path):
+    parts = path.split(".")
+    p = parts[0]
+    time_window_alias = parts[1]
+    p = p[:p.index("T")] + p[p.index("T"):].replace("-", ":")
+    d = datetime.datetime.fromisoformat(p)
+    # Substract 1ms from end time to get effectively exclusive end boundary
+    return (d, d + pd.to_timedelta(time_window_alias) - pd.to_timedelta("1ms"))
+
+
+def read_one_vct(vct_path, quantile="2.5", frac=0.1, maxn=0):
+    if quantile not in ["2.5", "50", "97.5"]:
+        raise ValueError("read_one_vct: quantile must be one of ['2.5', '50', '97.5']")
+    qflag_col = "q{:s}".format(quantile)
+    pop_col = "pop_q{:s}".format(quantile)
+    df = pd.read_parquet(
+        vct_path,
+        columns=["date", "fsc_small", "chl_small", "pe", qflag_col, pop_col],
+        filters=[(qflag_col, "=", True), (pop_col, "!=", "beads")]
+    )
+    df = df.rename(columns={pop_col: "pop"}).drop([qflag_col], axis=1)
+    dfsub = df.groupby("date").sample(frac=frac, random_state=1)
+    # In case any timepoint has too many particles
+    if maxn > 0:
+      dfsub = dfsub.groupby("date").head(maxn)
+    return dfsub
+
+
+def read_vct_files(vct_dir, quantile="2.5", frac=0.1, start=None, end=None, maxn=0):
+    """
+    Read VCT data for change point estimation.
+    
+    Parameters:
+    start = start datetime, inclusive.
+    end = end datetime, inclusive.
+    
+    Returns:
+    DataFrame of [fsc_small, chl_small, pe, pop] VCT data, with beads removed and subsampled
+    at each time point down to frac. Returns None if no data within time range is found.
+    """
+    # Get file listing as list of 3-tuples (path, start_datetime, end_datetime)
+    paths = []
+    for p in sorted(os.listdir(vct_dir)):
+        if not p.endswith(".vct.parquet"):
+            continue
+        file_start, file_end = filename_to_dates(p)
+        paths.append({
+            "file_path": os.path.join(vct_dir, p),
+            "file_start": file_start,
+            "file_end": file_end
+        })
+        
+    if start is not None:
+        paths = [p for p in paths if p["file_end"] >= start]
+    if end is not None:
+        paths = [p for p in paths if p["file_start"] <= end]
+
+    dfs = [read_one_vct(p["file_path"], quantile=quantile, frac=frac, maxn=maxn) for p in paths]
+    if dfs:
+        df = pd.concat(dfs, ignore_index=True).reset_index(drop=True)
+        if start is not None:
+            df = df.loc[df["date"] >= start]
+        if end is not None:
+            df = df.loc[df["date"] <= end]
+        df = df.sort_values(by=["date"]).reset_index(drop=True)
+
+        return df
+    return None
+
+
+def est_cps_objs(phys_data, max_cp, min_dist=5):
+    """
+    Estimate the locations of 0-max_cp change points in the physical data and return the corresponding objective values.
+
+    :param phys_data: Physical data on which to estimate change points.
+    :param max_cp: Largest number of change points to estimate.
+    :param min_dist: Minimum allowable distance between change points.
+    :return: objs_phys: Objective values when setting the number of change points to each of 0, 1, 2,..., max_cp (or the
+                        maximum possible number of changes given that the minimum distance between change points is
+                        min_dist).
+    """
+    phys_features = np.asarray(phys_data[['temp', 'salinity']])
+    phys_features = StandardScaler().fit_transform(phys_features)
+    cps_phys, objs_phys = cp_estimation.mkcpe(X=phys_features,
+                                              n_cp=(0, min(max_cp, int((len(phys_features) - 1) / min_dist) - 1)),
+                                              kernel_type='linear', min_dist=min_dist, return_obj=True)
+    for key in objs_phys:
+        objs_phys[key] = objs_phys[key]/len(phys_features)
+
+    return objs_phys
+
+
+def est_ncp_penalty(objs, n, alpha):
+    """
+    Estimate the number of change points using the penalty \alpha d/n(2log(n/d)+5) of Lebarbier (2005).
+
+    :param objs: Dictionary of objective values for each number of change points.
+    :param n: Length of the sequence.
+    :param alpha: Value of the parameter alpha.
+    :return: The estimated number of change points with the given value of alpha.
+    """
+    objs = np.array([objs[i] for i in range(0, len(objs))]).flatten()
+    d = np.arange(1, len(objs)+1)
+
+    return np.argmin(objs + alpha*d/n*(2*np.log(n/d)+5))
+
+
+def obj_ratios(objs_phys):
+    """
+    Compute the ratio of successive objective values when going from one number of change points to the next.
+
+    :param objs_phys: Dictionary of objective values for each number of change points.
+    :return: ratios: Array with the ratios of successive objective values.
+    """
+    objs_phys = [objs_phys[i] for i in range(0, len(objs_phys))]
+    objs_phys = np.array(objs_phys).flatten()
+    ratios = objs_phys[1:]/objs_phys[:-1]
+
+    return ratios
+
+
+def estimate_params_loo(cp_results, alphas, nus):
+    """
+    Estimate the values of alpha and nu in the methods for estimating the number of change points. Do this for each
+    cruise by using the annotations from all cruises except that one.
+
+    :param cp_results: Data frame with the cruise names, lengths, number of change points in the annotation files,
+                       objective values from change-point estimation, and ratios of objective values for each cruise.
+    :param alphas: Parameter values to try for the method of Lebarbier (2005).
+    :param nus: Parameter values to try for the method of Harchaoui and Levy-Leduc (2007).
+    :return: cp_results: Updated data frame with the estimated number of change points from both methods and the chosen
+                         parameter values.
+    """
+    ncruises = len(cp_results)
+    cp_results['n_est_cps_penalty'] = np.zeros(ncruises, dtype=int)
+    cp_results['n_est_cps_rule_thumb'] = np.zeros(ncruises, dtype=int)
+    for loo_idx in range(ncruises):
+        print('Estimating parameters for', cp_results.iloc[loo_idx]['cruise'], '- Cruise ', loo_idx+1, '/', ncruises)
+        errors_penalty = np.zeros(len(alphas))
+        for alpha_num, alpha in enumerate(alphas):
+            for i in range(ncruises):
+                if i != loo_idx:
+                    n_est_cps = est_ncp_penalty(cp_results.iloc[i]['objs'], cp_results.iloc[i]['n'], alpha)
+                    errors_penalty[alpha_num] += np.abs(n_est_cps - cp_results.iloc[i]['n_cp'])
+        best_alpha_idx = np.argmin(errors_penalty)
+
+        errors_rule_thumb = np.zeros(len(nus))
+        for nu_num, nu in enumerate(nus):
+            for i in range(ncruises):
+                if i != loo_idx:
+                    n_est_cps = est_ncp_rule_thumb(cp_results.iloc[i]['ratios'], nu)
+                    errors_rule_thumb[nu_num] += np.abs(n_est_cps - cp_results.iloc[i]['n_cp'])
+        best_nu_idx = np.argmin(errors_rule_thumb)
+
+        cp_results.at[loo_idx, 'n_est_cps_penalty'] = int(est_ncp_penalty(cp_results.iloc[loo_idx]['objs'],
+                                                              cp_results.iloc[loo_idx]['n'],
+                                                              alphas[best_alpha_idx]))
+        cp_results.at[loo_idx, 'n_est_cps_rule_thumb'] = int(est_ncp_rule_thumb(cp_results.iloc[loo_idx]['ratios'],
+                                                                          nus[best_nu_idx]))
+        cp_results.at[loo_idx, 'alpha'] = alphas[best_alpha_idx]
+        cp_results.at[loo_idx, 'nu'] = nus[best_nu_idx]
+
+    return cp_results
+
+
+def estimate_ncp(data_dir, cruises, max_cp, alphas, nus, output_dir, min_dist=5):
+    """
+    Annotate the change points in the physical data from the directory data_dir.
+
+    :param data_dir: Directory containing the files with the cleaned physical data and annotated change points.
+    :param cruises: List of cruises to use.
+    :param max_cp: Maximum number of allowable change points.
+    :param alphas: Parameter values to try for the method of Lebarbier (2005).
+    :param nus: Parameter values to try for the method of Harchaoui and Levy-Leduc (2007).
+    :param output_dir: Directory where the annotation results should be stored. The file will be called
+                       estimated_ncp.pickle.
+    :param min_dist: Minimum allowable distance between change points.
+    """
+    for cruise_num, cruise in enumerate(cruises):
+        print('Estimating physical change points for', cruise, '- Cruise ', cruise_num+1, '/', len(cruises))
+        phys_data = pd.read_parquet(os.path.join(data_dir, cruise + '_phys.parquet'))
+        n = len(phys_data)
+        n_cp = len(json.load(open(os.path.join(data_dir, cruise + '_annotated_phys_cps.json'), 'r')))
+        objs_phys = est_cps_objs(phys_data, max_cp, min_dist=min_dist)
+        all_ratios = obj_ratios(objs_phys)
+        if cruise_num == 0:
+            cp_results = pd.DataFrame({'cruise': cruise, 'n': n, 'n_cp': n_cp, 'ratios': [all_ratios],
+                                       'objs': [objs_phys]})
+        else:
+            cp_results = cp_results.append({'cruise': cruise, 'n': n, 'n_cp': n_cp, 'ratios': all_ratios,
+                                            'objs': objs_phys}, ignore_index=True)
+    cp_results = estimate_params_loo(cp_results, alphas, nus)
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    cp_results.to_pickle(os.path.join(output_dir, 'estimated_ncp.pickle'))
+
+
+def generate_features(bio_data_file, phys_data_file, features_file, projection_dim=128):
+    """
+    Generate features for the physical and biological data from each cruise.
+
+    :param cruise: Cruise to generate features for.
+    :param data_dir: Directory where the (cleaned) biological and physical data is stored.
+    :param features_dir: Directory where the features will be stored.
+    :param projection_dim: Dimensions to use for the projection for the biological data.
+    """
+    os.makedirs(os.path.dirname(features_file), exist_ok=True)
+
+    print('Generating features')
+    # Load the data
+    bio_data = pd.read_parquet(bio_data_file)
+    times = np.array(pd.Series(bio_data['date']).astype('category').cat.codes.values + 1)
+    bio_data = np.log10(np.asarray(bio_data[['fsc_small', 'chl_small', 'pe']]))
+    phys_data = pd.read_parquet(phys_data_file)
+
+    # Generate the features
+    phys_features = np.asarray(phys_data[['salinity', 'temp']])
+    phys_features = StandardScaler().fit_transform(phys_features)
+
+    print('Dimension of projection:', projection_dim)
+    bio_features, _, _, scaler, _, centroids, bandwidth = feature_generation.nystroem_features(
+        bio_data,
+        projection_dim,
+        window_length=1,
+        do_pca=False,
+        window_overlap=0,
+        times=times,
+        seed=0,
+        kmeans_iters=100,
+        standardize=True
+    )
+    pickle.dump({'bio_features': bio_features.astype('float64'), 'phys_features': phys_features,
+                 'bandwidth': bandwidth, 'centroids': centroids, 'scaler': scaler}, open(features_file, 'wb'))
+
+
+def est_cps(features_file, alpha, phys_cps_file, bio_cps_file, max_ncp=150, min_dist=5,
+            kernel_type='Gaussian-Euclidean'):
+    """
+    Estimate the locations of change points in the input biological and physical features for a single cruise.
+
+    :param features_file: pickle file with physical and biological features
+    :param alpha alpha parameter for change point number estimation
+    :param phys_cps_file JSON file for physical change point output
+    :param bio_cps_file JSON file for biological change point output
+    :param max_ncp: Maximum number of change points in a sequence.
+    :param min_dists: List of minimum acceptable distances between change points.
+    :param kernel_type: 'Gaussian-Euclidean' (Gaussian RBF kernel) or 'Linear'.
+    """
+    # Method to use for obtaining the bandwidth(s). Either 'rule-of-thumb' or 'list'.
+    bw_method = 'rule-of-thumb'
+    features = pickle.load(open(features_file, 'rb'))
+    phys_features, bio_features  = features['phys_features'], features['bio_features']
+
+    os.makedirs(os.path.dirname(phys_cps_file), exist_ok=True)
+    os.makedirs(os.path.dirname(bio_cps_file), exist_ok=True)
+
+    # Perform change-point estimation on the physical data
+    cps_phys, objs_phys = cp_estimation.mkcpe(X=phys_features,
+                                                n_cp=(0, min(max_ncp, int((len(phys_features)-1)/min_dist)-1)),
+                                                kernel_type='linear', min_dist=min_dist, return_obj=True)
+    for key in cps_phys.keys():
+        cps_phys[key] = cps_phys[key].flatten().tolist()
+    # Estimate number of change points
+    for key in objs_phys:
+        objs_phys[key] = objs_phys[key]/len(phys_features)
+    n_est_cps = est_ncp_penalty(objs_phys, len(phys_features), alpha)
+    logging.info("estimated number of physical data change points is %d", n_est_cps)
+
+    json.dump({
+        'cps_phys': cps_phys,
+        'objs_phys': objs_phys,
+        'n_est_cps_phys': int(n_est_cps)
+    }, open(phys_cps_file, 'w'))
+
+    # Get the bandwidth(s) (if applicable)
+    if kernel_type != 'Linear':
+        rot_bw, bws = get_bw_range(bio_features)
+        all_bws = [rot_bw] if bw_method == 'rule-of-thumb' else bws
+    else:
+        all_bws = [0]
+    for bw in all_bws:
+        # Perform change-point estimation on the biological data
+        cps_bio, objs_bio = cp_estimation.mkcpe(X=bio_features,
+                                                n_cp=(1, min(max_ncp, int((len(bio_features)-1)/min_dist)-1)),
+                                                kernel_type=kernel_type, bw=bw, min_dist=min_dist,
+                                                return_obj=True)
+        for key in cps_bio.keys():
+            cps_bio[key] = cps_bio[key].flatten().tolist()
+
+        bw_short = 'rule-of-thumb_' + str(np.round(bw, 3)) if bw_method == 'rule-of-thumb' else \
+                    str(np.round(bw, 3))
+        logging.info("used bw=%s for biological change points",  bw_short)
+        json.dump({
+            'cps_bio': cps_bio,
+            'bw': bw,
+            'objs_bio': objs_bio
+        }, open(bio_cps_file, 'w'))
+
+
+def get_bw_range(features):
+    """
+    Get the rule-of-thumb bandwidth and a range of bandwidths on a log scale for the Gaussian RBF kernel.
+
+    :param features: Features to use to obtain the bandwidths.
+    :return: Tuple consisting of:
+
+        * rule_of_thumb_bw: Computed rule-of-thumb bandwidth.
+        * bws: List of bandwidths on a log scale.
+    """
+    dists = sklearn.metrics.pairwise.pairwise_distances(features).reshape(-1)
+    rule_of_thumb_bw = np.median(dists)
+    gammas = np.logspace(np.log(0.5/np.percentile(dists, 99)**2), np.log(0.5/np.percentile(dists, 1)**2), 10, base=np.e)
+    bws = np.sqrt(1/(2*gammas))
+
+    return rule_of_thumb_bw, bws
+
+
+def step_1_find_best_alpha(cruises, data_dir, output_dir):
+    """Estimated number of change points for all cruises from paper and find best alpha"""
+    t1 = time.time()
+    # Parameter values to consider when optimizing the criteria for the number of change points
+    alphas = np.arange(0, 1, 0.01)
+    nus = np.arange(0.01, 0.1, 0.001)
+    # Maximum number of possible change points
+    max_cp = 150
+    estimate_ncp(data_dir, cruises, max_cp, alphas, nus, output_dir)
+    t2 = time.time()
+    print('Estimate num change points for alpha runtime:', t2-t1)
+    with open(os.path.join(output_dir, 'estimated_ncp_for_alpha.pickle'), 'rb') as fh:
+        cp_results = pickle.load(fh)
+    print(cp_results)
+    return cp_results
+
+
+def step_2_estimate_ncp(cruises, data_dir, output_dir, alpha):
+    """Estimated number of change points in cruises"""
+    t1 = time.time()
+    for cruise_num, cruise in enumerate(cruises):
+        print('Estimating physical change points for', cruise)
+        # Maximum number of possible change points
+        max_cp = 150
+        phys_data = pd.read_parquet(os.path.join(data_dir, cruise + '_phys.parquet'))
+        n = len(phys_data)
+        objs_phys = est_cps_objs(phys_data, max_cp)
+        all_ratios = obj_ratios(objs_phys)
+        n_est_cps_penalty = int(est_ncp_penalty(objs_phys, n, alpha))
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        if cruise_num == 0:
+            cp_results = pd.DataFrame({'cruise': cruise, 'n': n, 'ratios': [all_ratios],
+                                       'objs': [objs_phys], 'n_est_cps_penalty': n_est_cps_penalty})
+        else:
+            cp_results = cp_results.append({'cruise': cruise, 'n': n, 'ratios': [all_ratios],
+                                            'objs': [objs_phys], 'n_est_cps_penalty': n_est_cps_penalty},
+                                           ignore_index=True)
+        
+    cp_results.to_pickle(os.path.join(output_dir, 'estimated_ncp.pickle'))
+    t2 = time.time()
+    print('Estimate num change points runtime:', t2-t1)
+    print(cp_results)
+    return cp_results
+
+
+def create_bio_data(vct_dir, outpath, phys_data_file, quantile="2.5", maxn=0, frac=0.1,
+                    start=None, end=None):
+    """
+    Create a cytogram dataframe for the change point detection and save as parquet.
+
+    A random subsample of the data (frac) at each 3 minute time point is collected
+    for the dataframe. Particles labeled as "beads" and at timepoints with no
+    corresponding entry in the physical data are removed.
+
+    Columns in the saved dataframe are "date", "fsc_small", "chl_small", and "pe".
+    """
+    bio_df = read_vct_files(vct_dir, quantile=quantile, maxn=maxn, frac=frac, start=start, end=end)
+    phys_df = pd.read_parquet(phys_data_file)
+    phys_times = phys_df["date"].dt.floor("min")
+    good_times_idx = bio_df["date"].dt.floor("min").isin(phys_times)
+    bad_times_idx = ~good_times_idx
+    bad_times = list(bio_df["date"][bad_times_idx].unique().map(lambda x: x.isoformat()))
+    bio_df = bio_df[good_times_idx]
+    logging.info("Removed %d bio particles not covered by physical data", bad_times_idx.sum())
+    logging.info("Removed %d time points: %s", len(bad_times), "\n".join(bad_times))
+    if bio_df is None:
+        raise ValueError("no VCT data found in {}".format(vct_dir))
+    os.makedirs(os.path.dirname(outpath), exist_ok=True)
+    bio_df.to_parquet(outpath)
+
+
+def create_phys_data_cruisemic(underway_dir, outpath, salinity_range=[29, 38],
+                              temp_range=[5, 30], start=None, end=None):
+    """Create temperature and salinity dataframe and save as parquet."""
+    with open(os.path.join(underway_dir, "metadata"), "rt") as fh:
+        meta = json.loads(fh.read())
+    salcol, tempcol = meta["SalinityCol"], meta["TemperatureCol"]
+    with open(os.path.join(underway_dir, meta["ThermoFeed"]), "rt") as fh:
+        df = pd.read_csv(
+            fh,
+            sep="\t",
+            skiprows=6,
+            parse_dates=["time"],
+            usecols=["time", tempcol, salcol]
+        )
+    df = df.rename(columns={"time": "date", salcol: "salinity", tempcol: "temp"})
+    n1 = len(df.index)
+    df = fix_phys(df, salinity_range, temp_range, start, end)
+    n2 = len(df.index)
+    logging.info(
+        "Removed %d physical time points outside salinity range (%s) or temp range (%s)",
+        n1 - n2,
+        salinity_range,
+        temp_range
+    )
+    os.makedirs(os.path.dirname(outpath), exist_ok=True)
+    df.to_parquet(outpath)
+
+
+def create_phys_data_db(db, outpath, salinity_range=[29, 38], temp_range=[5, 30],
+                        start=None, end=None):
+    """Create temperature and salinity dataframe and save as parquet."""
+    query = "SELECT date, salinity, ocean_tmp as temp FROM sfl ORDER BY date ASC"
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        df = pd.read_sql_query(query, conn)
+    df["date"] = pd.to_datetime(df["date"])
+    df = fix_phys(df, salinity_range, temp_range, start, end)
+    os.makedirs(os.path.dirname(outpath), exist_ok=True)
+    df.to_parquet(outpath)
+
+
+def fix_phys(df, salinity_range, temp_range, start=None, end=None):
+    """
+    Resample to 1min resolution and remove basic outlier points from physical data.
+
+    Read data and clean according to paper method
+    
+    ---------------------------------------------------------------------------------------------
+    The data are cleaned as follows. For the physical data, we first remove the observation times
+    that are not in chronological order. Next, we discard observations for which the temperature
+    and salinity are unavailable or are not between the 1st and the 99th percentiles across all
+    cruises (i.e. between 5℃ and 30℃ for temperature and 29 PSU and 38 PSU for salinity). For the
+    biological data, we exclude files for which the physical data are not available. We also
+    delete the entries corresponding to added calibration beads rather than phytoplankton.
+    Prior to performing the analysis, we take the log (base 10) of the biological data and
+    standardize the physical and biological data separately for each cruise.
+    ---------------------------------------------------------------------------------------------
+
+    Taking the log base 10 of bio data will be done later during feature generation.
+    """
+    n1 = len(df.index)
+    df = df.resample("1T", on="date").mean().dropna(how="all").reset_index()
+    df = df[(df["salinity"] >= salinity_range[0]) & (df["salinity"] <= salinity_range[1])]
+    df = df[(df["temp"] >= temp_range[0]) & (df["temp"] <= temp_range[1])]
+    if start is not None:
+        df = df.loc[df["date"] >= start]
+    if end is not None:
+        df = df.loc[df["date"] <= end]
+    df = df.sort_values(by=["date"]).reset_index(drop=True)
+    n2 = len(df.index)
+    logging.info(
+        "Removed %d physical time points outside salinity range (%s), temp range (%s), time range, or overlapping by minute",
+        n1 - n2,
+        salinity_range,
+        temp_range
+    )
+    return df
+
+
+def cp_dates(phys_data_file, bio_data_file, phys_cps_file, bio_cps_file,
+             project, filetype, phys_cps_dates_file, bio_cps_dates_file):
+    phys_dates = pd.read_parquet(phys_data_file, columns=["date"])["date"].astype("category").cat.categories
+    bio_dates = pd.read_parquet(bio_data_file, columns=["date"])["date"].astype("category").cat.categories
+
+    phys_cps = json.loads(open(phys_cps_file).read())
+    bio_cps = json.loads(open(bio_cps_file).read())
+
+    n_cps_phys = phys_cps["n_est_cps_phys"]
+    n_cps_bio = n_cps_phys  # maybe use estimated by bio in future
+
+    phys_cps_dates_idx = [i - 1 for i in phys_cps["cps_phys"][str(n_cps_phys)]]
+    bio_cps_dates_idx = [i - 1 for i in bio_cps["cps_bio"][str(n_cps_bio)]]
+
+    phys_cps_dates_df = pd.DataFrame({"time": phys_dates[phys_cps_dates_idx]})
+    phys_cps_dates_df["flag"] = 1
+    with open(phys_cps_dates_file, "w") as fh:
+        fh.write("{}\n".format(project))
+        fh.write("{}Phys\n".format(filetype))
+        fh.write("Physical change points detected by chapydette\n")
+        fh.write("\t".join(["RFC3339", "change point detected"]) + "\n")
+        fh.write("\t".join(["time", "integer"]) + "\n")
+        fh.write("\t".join(["NA", "NA"]) + "\n")
+        phys_cps_dates_df.to_csv(fh, sep="\t", index=False)
+
+    bio_cps_dates_df = pd.DataFrame({"time": bio_dates[bio_cps_dates_idx]})
+    bio_cps_dates_df["flag"] = 1
+    with open(bio_cps_dates_file, "w") as fh:
+        fh.write("{}\n".format(project))
+        fh.write("{}Bio\n".format(filetype))
+        fh.write("Biological change points detected by chapydette\n")
+        fh.write("\t".join(["RFC3339", "change point detected"]) + "\n")
+        fh.write("\t".join(["time", "integer"]) + "\n")
+        fh.write("\t".join(["NA", "NA"]) + "\n")
+        bio_cps_dates_df.to_csv(fh, sep="\t", index=False)
+
+
+def validate_timestamp(ctx, param, value):
+    try:
+        date = pd.to_datetime(value)
+    except ValueError as e:
+        raise click.BadParameter(str(e))
+    return date
+
+
+@click.command()
+@click.option('--project', type=str, default="Test", help='Project identifier')
+@click.option('--filetype', type=str, default="ChangePoints",
+    help='Output TSDATA file type label prefix. "Phys" and "Bio" will be automatically appended.')
+@click.option('--start', type=str, callback=validate_timestamp, help='Earliest timepoint RFC3339 timestamp')
+@click.option('--end', type=str, callback=validate_timestamp, help='Latest timepoint RFC3339 timestamp')
+@click.option('--maxn-per-timepoint', type=int, default=0, help='Max particles per 3-min timepoint (0 disables this limit)')
+@click.option('--frac-per-timepoint', type=float, default=0.1, help='Fraction of particles per 3-min timepoint')
+@click.option('--vct-dir', required=True, type=click.Path(exists=True), help='VCT directory')
+@click.option('--phys', required=True, type=click.Path(exists=True, dir_okay=True), help='Popcycle db file or cruisemic underway folder')
+@click.option('--out-dir', required=True, help='Output directory')
+def cli(project, filetype, start, end, maxn_per_timepoint, frac_per_timepoint, vct_dir, phys, out_dir):
+    """Perform change point detection on SeaFlow data."""
+    t0_run = time.time()
+    logging.basicConfig(format='%(asctime)s %(message)s', datefmt='%m/%d/%Y %H:%M:%S.%s', level=logging.INFO)
+    logging.info("Starting run")
+
+    # vct_dir = "/app/newdata/KM1906_vct"
+    # db = "/app/newdata/KM1906.db"
+    # out_dir = "/app/output/KM1906"
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Output file paths
+    phys_data_file = os.path.join(out_dir, "data.phys.parquet")
+    bio_data_file = os.path.join(out_dir, "data.bio.parquet")
+    features_file = os.path.join(out_dir, "features.pickle")
+    phys_cps_file = os.path.join(out_dir, "cps.phys.json")
+    bio_cps_file = os.path.join(out_dir, "cps.bio.json")
+    phys_cps_dates_file = os.path.join(out_dir, "cps.dates.bio.tsdata")
+    bio_cps_dates_file = os.path.join(out_dir, "cps.dates.phys.tsdata")
+
+    # Hard coded values determined from example dataset provided with cytosegmenter
+    alpha = 0.13
+    projection_dim = 128
+
+    logging.info("Creating physical data file")
+    t0 = time.time()
+    if os.path.isfile(phys):
+        create_phys_data_db(phys, phys_data_file, start=start, end=end)
+    elif os.path.isdir(phys):
+        create_phys_data_cruisemic(phys, phys_data_file, start=start, end=end)
+    t1 = time.time()
+    logging.info("Finished in %.04fs\n", t1-t0)
+
+    logging.info("Creating biological cytogram data file")
+    t0 = time.time()
+    create_bio_data(
+        vct_dir, bio_data_file, phys_data_file, quantile="50", maxn=maxn_per_timepoint,
+        frac=frac_per_timepoint, start=start, end=end
+    )
+    t1 = time.time()
+    logging.info("Finished in %.04fs\n", t1-t0)
+
+    logging.info("Creating features file")
+    t0 = time.time()
+    generate_features(bio_data_file, phys_data_file, features_file, projection_dim=projection_dim)
+    t1 = time.time()
+    logging.info("Finished in %.04fs\n", t1-t0)
+
+    logging.info("Estimating change points")
+    t0 = time.time()
+    est_cps(features_file, alpha, phys_cps_file, bio_cps_file)
+    t1 = time.time()
+    logging.info("Finished in %.04fs\n", t1-t0)
+
+    logging.info("Retrieving dates for change points")
+    t0 = time.time()
+    cp_dates(
+        phys_data_file, bio_data_file,
+        phys_cps_file, bio_cps_file,
+        project, filetype,
+        phys_cps_dates_file, bio_cps_dates_file
+    )
+    t1 = time.time()
+    logging.info("Finished in %.04fs\n", t1-t0)
+
+    t1_run = time.time()
+    logging.info("Run completed in %.04fs\n", t1_run - t0_run)
+
+if __name__ == "__main__":
+    cli()
