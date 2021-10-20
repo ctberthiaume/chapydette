@@ -17,6 +17,8 @@ import time
 from chapydette import feature_generation, cp_estimation
 
 
+VERSION = "0.2.0"
+
 def filename_to_dates(path):
     parts = path.split(".")
     p = parts[0]
@@ -531,6 +533,7 @@ def validate_timestamp(ctx, param, value):
 
 
 @click.command()
+@click.version_option(VERSION)
 @click.option('--project', type=str, default="Test", help='Project identifier')
 @click.option('--filetype', type=str, default="ChangePoints",
     help='Output TSDATA file type label prefix. "Phys" and "Bio" will be automatically appended.')
